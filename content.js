@@ -6,42 +6,6 @@
   let exportInProgress = false;
   let scanInProgress = false;
 
-  // ===========================================================================
-  // Tambahan v0.9.3-safe-community-traversal
-  // ===========================================================================
-
-  const COMMUNITY_SCAN_LIMITS = Object.freeze({
-    // Total pass communities jangan terlalu lama.
-    passMs: 120_000,
-
-    // Batasi jumlah komunitas yang discan pada satu pass.
-    maxCommunities: 60,
-
-    // Jika beberapa komunitas berturut-turut gagal dibuka/back, hentikan.
-    maxConsecutiveFailures: 3,
-
-    // Waktu maksimal mengumpulkan daftar komunitas dari index.
-    indexCollectMs: 15_000,
-
-    // Waktu maksimal mencari row komunitas di index.
-    locateRowMs: 3_500,
-
-    // Waktu maksimal menunggu detail komunitas terbuka.
-    openDetailMs: 3_000,
-
-    // Waktu maksimal scan dalam satu detail komunitas.
-    detailScanMs: 12_000,
-
-    // Waktu maksimal mencoba back dari detail ke index.
-    backMs: 3_200,
-
-    // Batas scroll index komunitas.
-    maxIndexScrollSteps: 60,
-
-    // Batas scroll detail komunitas.
-    maxDetailScrollSteps: 40
-  });
-
   async function waitUntil(predicate, timeoutMs = 2_500, intervalMs = 120) {
     const deadline = Date.now() + timeoutMs;
 
@@ -95,7 +59,7 @@
       }
 
       scanInProgress = true;
-      scanAllChats()
+      scanAllChats(message?.options || {})
         .then(sendResponse)
         .catch((error) =>
           sendResponse({ ok: false, error: normalizeError(error) })
@@ -105,17 +69,6 @@
         });
 
       return true;
-    }
-
-    // Dipertahankan untuk kompatibilitas dengan popup versi lama.
-    if (message?.type === "SCAN_VISIBLE_CHATS") {
-      try {
-        const chats = scanVisibleChatsOnly();
-        sendResponse({ ok: true, chats });
-      } catch (error) {
-        sendResponse({ ok: false, error: normalizeError(error) });
-      }
-      return undefined;
     }
 
     if (message?.type === "EXPORT_SELECTED_CHATS") {
@@ -146,43 +99,7 @@
     return undefined;
   });
 
-  function scanVisibleChatsOnly() {
-    const pane = document.querySelector("#pane-side");
-
-    if (!pane) {
-      throw new Error(
-        "Sidebar WhatsApp belum ditemukan. Pastikan WhatsApp Web sudah selesai dimuat."
-      );
-    }
-
-    chatRegistry.clear();
-    scanGeneration += 1;
-    const chats = [];
-
-    for (const row of findChatRows(pane)) {
-      const descriptor = extractChatDescriptor(row, "all");
-      if (!descriptor.name || descriptor.is_announcement) continue;
-
-      const id = `scan-${scanGeneration}-chat-${chats.length}`;
-      const entry = {
-        id,
-        name: descriptor.name,
-        preview: descriptor.preview,
-        community_name: descriptor.community_name,
-        source_kind: descriptor.source_kind,
-        identity_key: descriptor.identity_key,
-        title_aliases: descriptor.title_aliases || [],
-        scan_top: 0,
-        scan_order: chats.length
-      };
-      chatRegistry.set(id, entry);
-      chats.push(publicChatEntry(entry));
-    }
-
-    return chats;
-  }
-
-  async function scanAllChats() {
+  async function scanAllChats(scanOptions = {}) {
     // v0.9.0: normalisasi titik awal. Sebelumnya hasil scan bergantung pada apakah
     // pengguna menekan Pindai dari Chats atau Communities. Sekarang selalu kembali
     // ke Chats terlebih dahulu, baru menjalankan pipeline All -> Groups -> Communities.
@@ -203,21 +120,7 @@
       skippedAnnouncementKeys: new Set(),
       totalSteps: 0,
       reachedLimit: false,
-      scanPasses: [],
-      communityNavigationAttempted: false,
-      communityNavigationCompleted: false,
-      communitiesOpened: 0,
-      communityDetailGroupsFound: 0,
-      communityDetailPanelsScanned: 0,
-      communityNavigationError: null,
-      authoritativeCommunityNames: new Set(),
-      authoritativeCommunityChildKeys: new Set(),
-      communityTraversalStopReason: null,
-      communityDetailGuardStops: 0,
-      communityIndexCount: 0,
-      communityOpenFailures: 0,
-      inactiveCommunityGroupsSkipped: 0,
-      skippedInactiveCommunityKeys: new Set()
+      scanPasses: []
     };
 
     // Pass 1: paksa filter All bila tersedia supaya private chat tetap masuk.
@@ -225,13 +128,9 @@
     if (switchedToAll) await sleep(500);
     await scanCurrentSidebarPass(state, "all");
 
-     // Pass 2: WhatsApp menyediakan filter Groups yang juga menampilkan subgroup
-    // Community.
-    //
-    // v0.9.3-safe:
-    // - verification pass Groups dihapus karena terlalu banyak loop,
-    // - Community traversal tetap dijalankan sebagai sumber authoritative,
-    // - scan Groups dibuat lebih cepat.
+     // Pass 2: filter Groups menampilkan subgroup Community sebagai row sidebar.
+    // Penamaan NAMA GROUP (NAMA COMMUNITY) diekstrak dari geometri row ini.
+    // Community traversal (panel Communities) DIHAPUS total — scan murni sidebar.
     const switchedToGroups = await switchChatFilter("groups");
 
     if (switchedToGroups) {
@@ -243,47 +142,23 @@
         renderWaitMs: 380,
         samplesPerViewport: 2
       });
-
-      try {
-        await scanCommunitiesNavigationPass(state);
-      } catch (error) {
-        state.communityNavigationError = normalizeError(error);
-      }
-
-      // Setelah deep scan, kembalikan ke Chats/All agar sidebar pengguna konsisten
-      // dan proses openChat berikutnya memiliki daftar chat umum sebagai titik awal.
-      await restoreChatsNavigation();
-      await switchChatFilter("all");
-      await sleep(300);
-    } else {
-      // Jika filter Groups tidak tersedia, tetap coba panel Community yang sedang
-      // terbuka. Ini berguna pada rollout UI yang memindahkan Communities ke rail.
-      try {
-        await scanCommunitiesNavigationPass(state);
-      } catch (error) {
-        state.communityNavigationError = normalizeError(error);
-      }
-
-      await restoreChatsNavigation();
     }
 
-    const scannedEntries = Array.from(state.discovered.values()).sort(compareScannedEntries);
+    // Kembalikan navigasi ke Chats/All agar sidebar pengguna konsisten dan proses
+    // openChat berikutnya memiliki daftar chat umum sebagai titik awal.
+    await restoreChatsNavigation();
+    if (switchedToGroups) {
+      await switchChatFilter("all");
+    }
+    await sleep(300);
 
-    // v0.9.0: Community detail panel adalah sumber identitas yang authoritative.
-    // Flat scan All/Groups tetap dipakai sebagai fallback, tetapi jika sebuah
-    // Community berhasil dipindai lewat hierarchy-nya, buang wrapper/mislabel
-    // hasil flat scan agar subgroup tidak muncul dua kali dengan nama Community.
-    const {
-      entries: communityReconciledEntries,
-      removedCount: staleCommunityEntriesRemoved
-    } = reconcileAuthoritativeCommunityEntries(scannedEntries, state);
+    const scannedEntries = Array.from(state.discovered.values()).sort(compareScannedEntries);
 
     const {
       entries: withoutCommunityContainers,
       removedCount: communityContainersRemoved
-    } = removeCommunityContainerEntries(communityReconciledEntries);
+    } = removeCommunityContainerEntries(scannedEntries);
 
-    const repairedCommunityEntries = 0;
     const {
       entries,
       mergedCount: postRepairMergedEntries
@@ -301,8 +176,6 @@
       discoveredChats: entries.length,
       communityGroups: communityGroupCount,
       announcementsSkipped: state.announcementsSkipped,
-      inactiveCommunityGroupsSkipped: state.inactiveCommunityGroupsSkipped,
-      communitiesDiscovered: state.communityIndexCount,
       scanStep: state.totalSteps,
       scanPass: "completed",
       completed: true
@@ -319,22 +192,8 @@
         scan_passes: state.scanPasses,
         groups_filter_scanned: state.scanPasses.includes("groups"),
         groups_verification_pass: switchedToGroups,
-        community_orientation_repairs: repairedCommunityEntries,
         community_containers_removed: communityContainersRemoved,
-        stale_flat_community_entries_removed: staleCommunityEntriesRemoved,
         post_repair_merged_entries: postRepairMergedEntries,
-        community_navigation_attempted: state.communityNavigationAttempted,
-        community_navigation_completed: state.communityNavigationCompleted,
-        communities_opened: state.communitiesOpened,
-        community_detail_panels_scanned: state.communityDetailPanelsScanned,
-        community_detail_groups_found: state.communityDetailGroupsFound,
-        community_navigation_error: state.communityNavigationError,
-        community_traversal_stop_reason: state.communityTraversalStopReason,
-        community_detail_guard_stops: state.communityDetailGuardStops,
-        communities_discovered: state.communityIndexCount,
-        community_open_failures: state.communityOpenFailures,
-        inactive_community_groups_skipped: state.inactiveCommunityGroupsSkipped,
-        community_membership_policy: "groups_you_are_in_only_with_join_section_filter",
         reached_scan_step_limit: state.reachedLimit
       }
     };
@@ -527,289 +386,6 @@
   // needs an explicit Communities-panel pass instead of assuming the Groups filter
   // always renders every subgroup as a normal #pane-side row.
 
-  async function scanCommunitiesNavigationPass(state) {
-    state.communityNavigationAttempted = true;
-
-    if (!state.scanPasses.includes("communities")) {
-      state.scanPasses.push("communities");
-    }
-
-    const limits = COMMUNITY_SCAN_LIMITS;
-    const deadline = Date.now() + limits.passMs;
-
-    try {
-      const communitiesNav = findPrimaryNavigationControl("communities");
-
-      if (!communitiesNav) {
-        state.communityNavigationError = "Tombol Communities tidak ditemukan.";
-        state.communityTraversalStopReason = "communities_nav_not_found";
-        return;
-      }
-
-      const initialListPanel = await ensureCommunitiesIndex(deadline, 2);
-
-      if (!initialListPanel) {
-        state.communityNavigationError = "Index Communities tidak berhasil dibuka.";
-        state.communityTraversalStopReason = "community_index_not_found";
-        return;
-      }
-
-      const communityNames = await collectCommunityIndexNames(
-        initialListPanel,
-        Math.min(deadline, Date.now() + limits.indexCollectMs)
-      );
-
-      state.communityIndexCount = communityNames.length;
-
-      emitScanProgress({
-        discoveredChats: state.discovered.size,
-        communityGroups: countCommunityGroups(state),
-        announcementsSkipped: state.announcementsSkipped,
-        inactiveCommunityGroupsSkipped: state.inactiveCommunityGroupsSkipped,
-        communitiesDiscovered: state.communityIndexCount,
-        scanStep: state.totalSteps,
-        scanPass: "communities",
-        completed: false
-      });
-
-      let consecutiveFailures = 0;
-
-      const selectedNames = communityNames.slice(0, limits.maxCommunities);
-
-      for (let index = 0; index < selectedNames.length; index += 1) {
-        if (Date.now() >= deadline) {
-          state.communityTraversalStopReason = "index_deadline";
-          break;
-        }
-
-        const communityName = selectedNames[index];
-
-        if (!normalizeComparable(communityName)) continue;
-
-        // 1) Pastikan selalu mulai dari index yang benar-benar bersih.
-        const indexPanel = await ensureCommunitiesIndex(deadline, 2);
-
-        if (!indexPanel) {
-          state.communityOpenFailures += 1;
-          consecutiveFailures += 1;
-
-          if (consecutiveFailures >= limits.maxConsecutiveFailures) {
-            state.communityTraversalStopReason = "index_unstable";
-            break;
-          }
-
-          continue;
-        }
-
-        // 2) Cari row komunitas berdasarkan snapshot nama.
-        let communityRow = null;
-
-        try {
-          communityRow = await locateCommunityIndexRow(
-            indexPanel,
-            communityName,
-            limits.locateRowMs
-          );
-        } catch (_error) {
-          communityRow = null;
-        }
-
-        if (!communityRow) {
-          state.communityOpenFailures += 1;
-          consecutiveFailures += 1;
-
-          if (consecutiveFailures >= limits.maxConsecutiveFailures) {
-            state.communityTraversalStopReason = "row_not_found";
-            break;
-          }
-
-          continue;
-        }
-
-        // 3) Buka detail komunitas.
-        communityRow.scrollIntoView({ block: "center", inline: "nearest" });
-        await sleep(90);
-
-        activateChatTarget(communityRow);
-
-        const detailPanel = await waitForCommunityDetailPanel(
-          communityName,
-          limits.openDetailMs
-        );
-
-        if (!detailPanel) {
-          state.communityOpenFailures += 1;
-          consecutiveFailures += 1;
-
-          // Jika ada panel detail nyasar / salah terbuka, coba tutup.
-          const wrongDetail = findLikelyOpenCommunityDetailPanel();
-
-          if (wrongDetail) {
-            await leaveCommunityDetailPanelVerified(
-              wrongDetail,
-              extractCommunityPanelTitle(wrongDetail),
-              1_600
-            );
-          }
-
-          if (consecutiveFailures >= limits.maxConsecutiveFailures) {
-            state.communityTraversalStopReason = "detail_not_opened";
-            break;
-          }
-
-          continue;
-        }
-
-        consecutiveFailures = 0;
-        state.communitiesOpened += 1;
-
-        const canonicalCommunity =
-          extractCommunityPanelTitle(detailPanel) || communityName;
-
-        // 4) Scan detail komunitas dengan limit yang lebih pendek.
-        let added = 0;
-
-        try {
-          added = await scanCommunityDetailPanelDeep(
-            state,
-            detailPanel,
-            canonicalCommunity,
-            "community_navigation"
-          );
-        } catch (error) {
-          state.communityNavigationError = normalizeError(error);
-        }
-
-        state.communityDetailPanelsScanned += 1;
-        state.communityDetailGroupsFound += added;
-
-        emitScanProgress({
-          discoveredChats: state.discovered.size,
-          communityGroups: countCommunityGroups(state),
-          announcementsSkipped: state.announcementsSkipped,
-          inactiveCommunityGroupsSkipped: state.inactiveCommunityGroupsSkipped,
-          communitiesDiscovered: state.communityIndexCount,
-          scanStep: state.totalSteps + index + 1,
-          scanPass: "community_detail",
-          completed: false
-        });
-
-        // 5) Kembali ke index dan verifikasi benar-benar kembali.
-        const closed = await leaveCommunityDetailPanelVerified(
-          detailPanel,
-          canonicalCommunity,
-          limits.backMs
-        );
-
-        if (!closed) {
-          const recovered = await hardResetToCommunitiesIndex(
-            Math.min(3_000, Math.max(800, deadline - Date.now()))
-          );
-
-          if (!recovered) {
-            state.communityNavigationError =
-              `Tidak dapat kembali ke daftar Communities setelah “${canonicalCommunity}”. ` +
-              `Traversal dihentikan agar tidak looping.`;
-
-            state.communityTraversalStopReason = "return_to_index_failed";
-
-            break;
-          }
-        }
-      }
-
-      if (!state.communityTraversalStopReason) {
-        state.communityTraversalStopReason = "completed_safe_traversal";
-      }
-
-      state.communityNavigationCompleted =
-        state.communityIndexCount > 0 && state.communityDetailPanelsScanned > 0;
-    } catch (error) {
-      state.communityNavigationError = normalizeError(error);
-      state.communityTraversalStopReason = "unexpected_error";
-    }
-  }
-
-  async function collectCommunityIndexNames(initialPanel, deadline) {
-    let panel = initialPanel;
-    let scroller = findPanelScroller(panel) || panel;
-
-    const names = new Map();
-
-    let stableBottomRounds = 0;
-    let noProgressRounds = 0;
-    let safety = 0;
-
-    const maxSafety = COMMUNITY_SCAN_LIMITS.maxIndexScrollSteps;
-
-    try {
-      scroller.scrollTop = 0;
-      await waitForSidebarRender(scroller, 260);
-    } catch (_error) {
-      // Abaikan.
-    }
-
-    while (safety < maxSafety && Date.now() < deadline) {
-      safety += 1;
-
-      panel = findCommunityListPanel() || panel;
-
-      if (!(panel instanceof HTMLElement)) break;
-
-      scroller = findPanelScroller(panel) || scroller || panel;
-
-      const beforeCount = names.size;
-
-      for (const row of findCommunityIndexRows(panel)) {
-        const name = cleanText(extractCommunityIndexName(row, panel));
-        const key = normalizeComparable(name);
-
-        if (!key || isScannerControlTitle(name) || isAnnouncementName(name)) {
-          continue;
-        }
-
-        if (!names.has(key)) names.set(key, name);
-      }
-
-      const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-      const atBottom = scroller.scrollTop >= maxTop - 4;
-
-      let moved = false;
-
-      if (atBottom) {
-        stableBottomRounds += 1;
-
-        if (stableBottomRounds >= 2) break;
-
-        await sleep(140);
-      } else {
-        stableBottomRounds = 0;
-
-        const beforeTop = scroller.scrollTop;
-        const step = Math.max(220, Math.floor(scroller.clientHeight * 0.82));
-
-        scroller.scrollTop = Math.min(maxTop, beforeTop + step);
-
-        await waitForSidebarRender(scroller, 260);
-
-        moved = Math.abs(scroller.scrollTop - beforeTop) >= 2;
-      }
-
-      const progressed = names.size > beforeCount || moved;
-
-      noProgressRounds = progressed ? 0 : noProgressRounds + 1;
-
-      if (noProgressRounds >= 3) break;
-    }
-
-    return Array.from(names.values());
-  }
-
-  function countCommunityGroups(state) {
-    return Array.from(state.discovered.values()).filter(
-      (entry) => entry.source_kind === "community_group"
-    ).length;
-  }
 
   function findPrimaryNavigationControl(kind) {
     const wanted = kind === "communities"
@@ -860,9 +436,26 @@
   }
 
   async function ensureChatsNavigationForScan() {
-    const hasChatSurface = () => Boolean(
-      document.querySelector("#pane-side") && findChatFilterControl("all")
-    );
+    // Deteksi "surface chat sudah siap". Jangan bergantung hanya pada filter
+    // "all" — pada beberapa build/keadaan loading filter itu belum dirender
+    // walau sidebar chat sudah ada. Cukup andalkan #pane-side + setidaknya ada
+    // satu row chat atau scroller yang bisa di-scroll.
+    const hasChatSurface = () => {
+      const pane = document.querySelector("#pane-side");
+      if (!(pane instanceof HTMLElement) || !isVisible(pane)) return false;
+      const rows = pane.querySelectorAll('[role="listitem"], span[title]');
+      if (rows.length > 0) return true;
+      const scroller = findSidebarScroller(pane);
+      return Boolean(scroller && scroller.scrollHeight > 0);
+    };
+
+    // Tunggu WhatsApp Web menyelesaikan render awal (maks ~15 detik) sebelum
+    // menyimpulkan gagal. Ini menangani klik Pindai yang terlalu cepat.
+    const initialDeadline = Date.now() + 15_000;
+    while (Date.now() < initialDeadline) {
+      if (hasChatSurface()) return true;
+      await sleep(200);
+    }
 
     if (hasChatSurface()) return true;
 
@@ -1262,335 +855,6 @@
     return Boolean(classifyCommunitySectionHeading(text));
   }
 
-  function getCommunityMembershipHeadings(panel) {
-    if (!(panel instanceof HTMLElement)) return [];
-    const rect = panel.getBoundingClientRect();
-    const tokens = getVisualTextTokensInRect(rect, panel);
-    return tokens
-      .map((token) => ({ ...token, mode: classifyCommunitySectionHeading(token.text) }))
-      .filter((token) => token.mode)
-      .sort((a, b) => a.top - b.top || a.left - b.left);
-  }
-
-  function getCommunityRowActionSemantic(row) {
-    if (!(row instanceof HTMLElement)) return "";
-    return cleanText([
-      row.innerText,
-      row.getAttribute("aria-label"),
-      row.getAttribute("title"),
-      ...Array.from(row.querySelectorAll('button, [role="button"], [aria-label], [title], [data-icon], [data-testid]'))
-        .slice(0, 40)
-        .flatMap((element) => [
-          element.innerText,
-          element.getAttribute?.("aria-label"),
-          element.getAttribute?.("title"),
-          element.getAttribute?.("data-icon"),
-          element.getAttribute?.("data-testid")
-        ])
-    ].filter(Boolean).join(" | "));
-  }
-
-  function rowHasJoinOrRequestAction(row) {
-    const semantic = normalizeComparable(getCommunityRowActionSemantic(row));
-    return /(?:^|\b)(join group|request to join|request to join group|minta bergabung|permintaan bergabung|gabung grup|bergabung ke grup)(?:$|\b)/.test(semantic);
-  }
-
-  function scanCommunityDetailViewport(state, panel, communityName, discoveredVia, membershipContext = { mode: null }) {
-    const canonicalCommunity = cleanText(communityName) || extractCommunityPanelTitle(panel) || "Community";
-    const communityKey = normalizeComparable(canonicalCommunity);
-    let addedCount = 0;
-    const rows = findVisualRowsInPanel(panel);
-    const headings = getCommunityMembershipHeadings(panel);
-    let carriedMode = membershipContext.mode || null;
-
-    for (const row of rows) {
-      const rect = row.getBoundingClientRect();
-      const tokens = getVisualTextTokensInRect(rect, panel);
-      if (tokens.length === 0) continue;
-
-      // Tentukan section membership berdasarkan heading terdekat di atas row.
-      // Karena deep scan selalu dimulai dari atas, carriedMode tetap benar ketika
-      // heading sudah keluar dari viewport pada scroll berikutnya.
-      for (const heading of headings) {
-        if (heading.top <= rect.top + 8) carriedMode = heading.mode;
-        else break;
-      }
-
-      const semanticTokens = tokens.map((token) => normalizeComparable(token.text)).filter(Boolean);
-      const onlyNavigation = semanticTokens.length > 0 && semanticTokens.every((value) =>
-        /^(back|kembali|navigation menu|menu navigasi|close|tutup|communities|komunitas)$/.test(value)
-      );
-      const nearHeader = rect.top <= panel.getBoundingClientRect().top + 112;
-      if (onlyNavigation || (nearHeader && semanticTokens.some((value) => /^(back|kembali|navigation menu|menu navigasi)$/.test(value)))) {
-        continue;
-      }
-
-      if (isAnnouncementVisualRow(row, tokens)) {
-        const announceKey = `community-panel-announcement:${communityKey}:${Math.round(rect.top)}`;
-        if (!state.skippedAnnouncementKeys.has(announceKey)) {
-          state.skippedAnnouncementKeys.add(announceKey);
-          state.announcementsSkipped += 1;
-        }
-        continue;
-      }
-
-      const childName = chooseCommunityChildFromTokens(tokens, canonicalCommunity);
-      if (!childName || isAnnouncementName(childName) || isScannerControlTitle(childName) || isCommunitySectionHeading(childName)) continue;
-      const childKey = normalizeComparable(childName);
-      const childCommunityKey = normalizeComparable(canonicalCommunity);
-      if (!childKey || childKey === communityKey || childKey === childCommunityKey) continue;
-
-      // Ini guard utama v0.9.2: subgroup yang berada di bagian "Groups you can
-      // join" / "Other groups" atau punya aksi Join/Request tidak boleh masuk
-      // registry ekspor. Community dapat menampilkan group yang user belum ikuti.
-      const inactiveBySection = carriedMode === "inactive";
-      const inactiveByAction = rowHasJoinOrRequestAction(row);
-      if (inactiveBySection || inactiveByAction) {
-        const inactiveKey = `${communityKey}|${childKey}`;
-        if (!state.skippedInactiveCommunityKeys.has(inactiveKey)) {
-          state.skippedInactiveCommunityKeys.add(inactiveKey);
-          state.inactiveCommunityGroupsSkipped += 1;
-        }
-        continue;
-      }
-
-      const tokenTexts = tokens.map((token) => token.text);
-      const preview = tokenTexts
-        .filter((text) => normalizeComparable(text) !== childKey)
-        .filter((text) => normalizeComparable(text) !== communityKey)
-        .filter((text) => !isScannerControlTitle(text))
-        .filter((text) => !isCommunitySectionHeading(text))
-        .filter((text) => !/^(back|kembali|navigation menu|menu navigasi)$/i.test(text))
-        .at(-1)?.slice(0, 160) || "";
-      const avatarKey = extractVisualAvatarKey(row);
-      const identityKey = `community-panel:${communityKey}|${childKey}|${avatarKey || simpleHash(normalizeComparable(preview))}`;
-      const descriptor = {
-        name: cleanText(childName),
-        preview,
-        community_name: canonicalCommunity,
-        source_kind: "community_group",
-        membership_status: carriedMode === "active" ? "active" : "active_assumed",
-        is_announcement: false,
-        is_community_container: false,
-        identity_key: identityKey,
-        alias_signature: buildAliasSignature([childName, canonicalCommunity]),
-        title_aliases: [cleanText(childName), canonicalCommunity],
-        local_name_source: "community_panel_geometry"
-      };
-
-      const result = upsertAuthoritativeCommunityEntry(state, descriptor, discoveredVia);
-      if (result.added) addedCount += 1;
-    }
-
-    if (headings.length > 0) membershipContext.mode = headings.at(-1).mode;
-    else membershipContext.mode = carriedMode;
-
-    if (communityKey) state.authoritativeCommunityNames.add(communityKey);
-    return addedCount;
-  }
-
-  async function scanCommunityDetailPanelDeep(state, panel, communityName, discoveredVia) {
-    if (!(panel instanceof HTMLElement)) return 0;
-    const canonicalCommunity = cleanText(communityName) || extractCommunityPanelTitle(panel) || "Community";
-    const scroller = findPanelScroller(panel);
-    const membershipContext = { mode: null };
-    let addedTotal = 0;
-
-    if (!scroller || scroller.scrollHeight - scroller.clientHeight < 30) {
-      addedTotal += scanCommunityDetailViewport(
-        state,
-        panel,
-        canonicalCommunity,
-        discoveredVia,
-        membershipContext
-      );
-      return addedTotal;
-    }
-
-    const originalTop = scroller.scrollTop;
-    const startedAt = Date.now();
-    const hardDeadline = startedAt + COMMUNITY_SCAN_LIMITS.detailScanMs;
-    let stableBottomRounds = 0;
-    let noProgressRounds = 0;
-    let safety = 0;
-    let lastFingerprint = "";
-
-    try {
-      scroller.scrollTop = 0;
-      await waitForSidebarRender(scroller, 420);
-
-      while (safety < COMMUNITY_SCAN_LIMITS.maxDetailScrollSteps && Date.now() < hardDeadline) {
-        safety += 1;
-        const childCountBefore = state.authoritativeCommunityChildKeys.size;
-        const inactiveBefore = state.skippedInactiveCommunityKeys.size;
-        const topBefore = scroller.scrollTop;
-        const heightBefore = scroller.scrollHeight;
-
-        addedTotal += scanCommunityDetailViewport(
-          state,
-          panel,
-          canonicalCommunity,
-          discoveredVia,
-          membershipContext
-        );
-
-        const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-        const atBottom = scroller.scrollTop >= maxTop - 4;
-        if (atBottom) {
-          stableBottomRounds += 1;
-          if (stableBottomRounds >= 2) break;
-          await sleep(280);
-        } else {
-          stableBottomRounds = 0;
-          const step = Math.max(160, Math.floor(scroller.clientHeight * 0.72));
-          scroller.scrollTop = Math.min(maxTop, topBefore + step);
-          await waitForSidebarRender(scroller, 300);
-
-          if (Math.abs(scroller.scrollTop - topBefore) < 2) {
-            scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: step, bubbles: true }));
-            await sleep(220);
-          }
-        }
-
-        const childCountAfter = state.authoritativeCommunityChildKeys.size;
-        const inactiveAfter = state.skippedInactiveCommunityKeys.size;
-        const topAfter = scroller.scrollTop;
-        const heightAfter = scroller.scrollHeight;
-        const fingerprint = [
-          Math.round(topAfter / 4),
-          Math.round(heightAfter / 4),
-          childCountAfter,
-          inactiveAfter,
-          membershipContext.mode || "unknown"
-        ].join(":");
-
-        const progressed =
-          childCountAfter > childCountBefore ||
-          inactiveAfter > inactiveBefore ||
-          Math.abs(topAfter - topBefore) >= 2 ||
-          Math.abs(heightAfter - heightBefore) >= 4;
-
-        if (progressed && fingerprint !== lastFingerprint) noProgressRounds = 0;
-        else noProgressRounds += 1;
-        lastFingerprint = fingerprint;
-
-        if (noProgressRounds >= 3) {
-          state.communityDetailGuardStops = Number(state.communityDetailGuardStops || 0) + 1;
-          break;
-        }
-      }
-      if (Date.now() >= hardDeadline || safety >= COMMUNITY_SCAN_LIMITS.maxDetailScrollSteps) {
-        state.communityDetailGuardStops = Number(state.communityDetailGuardStops || 0) + 1;
-      }
-    } finally {
-      try { scroller.scrollTop = originalTop; } catch (_) {}
-    }
-    return addedTotal;
-  }
-
-  function upsertAuthoritativeCommunityEntry(state, descriptor, discoveredVia) {
-    const childKey = normalizeComparable(descriptor.name || "");
-    const communityKey = normalizeComparable(descriptor.community_name || "");
-    const previewKey = normalizeComparable(descriptor.preview || "");
-
-    // 1) Exact authoritative entry from the same Community + child name.
-    let existing = Array.from(state.discovered.values()).find((entry) =>
-      entry.discovered_via_community_panel &&
-      normalizeComparable(entry.name || "") === childKey &&
-      normalizeComparable(entry.community_name || "") === communityKey
-    );
-
-    // 2) Upgrade a flat entry with the correct child name when it clearly refers
-    // to the same chat. This prevents All/Groups + Communities from duplicating it.
-    if (!existing) {
-      const sameName = Array.from(state.discovered.values()).filter((entry) =>
-        !entry.discovered_via_community_panel &&
-        normalizeComparable(entry.name || "") === childKey
-      );
-      existing = sameName.find((entry) => {
-        const entryCommunity = normalizeComparable(entry.community_name || "");
-        if (entryCommunity && entryCommunity !== communityKey) return false;
-        const entryPreview = normalizeComparable(entry.preview || "");
-        return Boolean(previewKey && entryPreview && previewKey === entryPreview);
-      }) || (
-        sameName.length === 1 && sameName[0].discovered_via_groups_filter
-          ? sameName[0]
-          : null
-      );
-    }
-
-    // 3) Specific regression: flat Community wrappers can be stored using the
-    // Community name while the preview belongs to the child row. Upgrade that row
-    // only when preview gives us a strong match.
-    if (!existing && previewKey) {
-      existing = Array.from(state.discovered.values()).find((entry) =>
-        !entry.discovered_via_community_panel &&
-        normalizeComparable(entry.name || "") === communityKey &&
-        normalizeComparable(entry.preview || "") === previewKey
-      ) || null;
-    }
-
-    if (existing) {
-      existing.name = descriptor.name;
-      existing.community_name = descriptor.community_name;
-      existing.source_kind = "community_group";
-      existing.membership_status = descriptor.membership_status || existing.membership_status || "active_assumed";
-      existing.discovered_via_community_panel = true;
-      existing.discovered_via_community = true;
-      existing.community_identity_authority = "detail_panel";
-      existing.preview = descriptor.preview || existing.preview || "";
-      existing.title_aliases = Array.from(new Set([
-        ...(existing.title_aliases || []),
-        ...(descriptor.title_aliases || [])
-      ].filter(Boolean)));
-      existing.alias_signature = buildAliasSignature(existing.title_aliases);
-      state.authoritativeCommunityChildKeys.add(`${communityKey}|${childKey}`);
-      return { entry: existing, added: false };
-    }
-
-    const id = `scan-${scanGeneration}-chat-${state.scanOrder}`;
-    const entry = {
-      id,
-      name: descriptor.name,
-      preview: descriptor.preview,
-      community_name: descriptor.community_name,
-      source_kind: "community_group",
-      membership_status: descriptor.membership_status || "active_assumed",
-      identity_key: descriptor.identity_key,
-      alias_signature: descriptor.alias_signature,
-      title_aliases: descriptor.title_aliases,
-      discovered_via: discoveredVia,
-      discovered_via_all: false,
-      discovered_via_groups_filter: false,
-      discovered_via_community_panel: true,
-      discovered_via_community: true,
-      community_identity_authority: "detail_panel",
-      scan_positions: {},
-      scan_top: 0,
-      scan_order: state.scanOrder,
-      first_scan_pass: "community",
-      scan_pass_rank: 2
-    };
-    state.discovered.set(id, entry);
-    state.scanOrder += 1;
-    state.authoritativeCommunityChildKeys.add(`${communityKey}|${childKey}`);
-    return { entry, added: true };
-  }
-
-  function extractVisualAvatarKey(row) {
-    if (!(row instanceof HTMLElement)) return "";
-    const image = row.querySelector('img[src], img[srcset]');
-    if (image instanceof HTMLImageElement) {
-      const src = image.currentSrc || image.getAttribute("src") || image.getAttribute("srcset") || "";
-      if (src) return `img:${simpleHash(src)}`;
-    }
-    const icon = row.querySelector('[data-icon], [data-testid]');
-    if (icon) {
-      const semantic = cleanText([icon.getAttribute("data-icon"), icon.getAttribute("data-testid")].filter(Boolean).join("|"));
-      if (semantic) return `icon:${simpleHash(semantic)}`;
-    }
-    return "";
-  }
 
   function findCommunityIndexRows(panel) {
     return findVisualRowsInPanel(panel).filter((row) => {
@@ -1616,254 +880,10 @@
     return chooseCommunityIndexNameFromTokens(tokens);
   }
 
-  async function leaveCommunityDetailPanel(panel) {
-    const rect = panel.getBoundingClientRect();
-    const controls = Array.from(panel.querySelectorAll('button, [role="button"], [tabindex]'))
-      .filter((element) => element instanceof HTMLElement && isVisible(element))
-      .filter((element) => {
-        const er = element.getBoundingClientRect();
-        return er.top <= rect.top + 105 && er.left <= rect.left + 125;
-      })
-      .map((element) => ({
-        element,
-        semantic: cleanText([
-          element.getAttribute("aria-label"),
-          element.getAttribute("title"),
-          element.getAttribute("data-icon"),
-          element.getAttribute("data-testid")
-        ].filter(Boolean).join(" | "))
-      }));
-    const preferred = controls.find((item) => /back|close|arrow-left|x-alt|kembali|tutup/i.test(item.semantic));
-    if (preferred) {
-      activateChatTarget(preferred.element);
-      return true;
-    }
-    // Fallback: click the left-most top control only when it is clearly small.
-    const fallback = controls
-      .map((item) => item.element)
-      .filter((element) => {
-        const er = element.getBoundingClientRect();
-        return er.width <= 80 && er.height <= 80;
-      })
-      .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0];
-    if (fallback) {
-      activateChatTarget(fallback);
-      return true;
-    }
-    return false;
-  }
-
-
-  async function leaveCommunityDetailPanelAndWait(panel) {
-    const clicked = await leaveCommunityDetailPanel(panel);
-    if (!clicked) return Boolean(findCommunityListPanel());
-
-    const deadline = Date.now() + 3_200;
-    while (Date.now() < deadline) {
-      await sleep(120);
-      const list = findCommunityListPanel();
-      if (list) return true;
-    }
-    return Boolean(findCommunityListPanel());
-  }
-
   // ===========================================================================
   // Helper back / recovery Community yang lebih aman
   // ===========================================================================
 
-  function findCommunityDetailBackControl(panel) {
-    const scopes = [];
-
-    if (panel instanceof HTMLElement) scopes.push(panel);
-
-    const paneSide = document.querySelector("#pane-side");
-    if (paneSide) scopes.push(paneSide);
-
-    scopes.push(document);
-
-    for (const scope of scopes) {
-      const candidates = Array.from(
-        scope.querySelectorAll('button, [role="button"], [tabindex]')
-      ).filter((element) => element instanceof HTMLElement && isVisible(element));
-
-      let best = null;
-      let bestScore = -Infinity;
-
-      for (const element of candidates) {
-        const rect = element.getBoundingClientRect();
-
-        if (rect.width > 96 || rect.height > 96) continue;
-        if (rect.width < 12 || rect.height < 12) continue;
-
-        const iconElement = element.matches("[data-icon]")
-          ? element
-          : element.querySelector("[data-icon]");
-
-        const icon = cleanText(iconElement?.getAttribute("data-icon") || "");
-
-        const semantic = cleanText([
-          element.getAttribute("aria-label"),
-          element.getAttribute("title"),
-          element.getAttribute("data-testid"),
-          icon
-        ].filter(Boolean).join(" | ")).toLowerCase();
-
-        const isBack = /arrow-left|back|kembali/.test(semantic);
-        const isClose = /close|x-alt|tutup/.test(semantic);
-
-        if (!isBack && !isClose) continue;
-
-        let score = isBack ? 140 : 80;
-
-        if (panel instanceof HTMLElement) {
-          const panelRect = panel.getBoundingClientRect();
-
-          if (
-            rect.top <= panelRect.top + 130 &&
-            rect.left <= panelRect.left + 150
-          ) {
-            score += 120;
-          }
-        } else {
-          score += 30;
-        }
-
-        score -= (rect.width + rect.height) / 4;
-
-        if (score > bestScore) {
-          best = element;
-          bestScore = score;
-        }
-      }
-
-      if (best) return best;
-    }
-
-    return null;
-  }
-
-  async function leaveCommunityDetailPanelVerified(panel, expectedName, timeoutMs = 3_200) {
-    const deadline = Date.now() + timeoutMs;
-
-    let currentPanel = panel;
-
-    for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt += 1) {
-      const backControl = findCommunityDetailBackControl(currentPanel);
-
-      if (backControl) {
-        activateChatTarget(backControl);
-      } else {
-        dispatchEscapeEvent();
-      }
-
-      const recovered = await waitUntil(
-        () => {
-          const stillDetail = expectedName
-            ? findCommunityDetailPanel(expectedName)
-            : findLikelyOpenCommunityDetailPanel();
-
-          const listPanel = findCommunityListPanel();
-
-          return !stillDetail && listPanel ? listPanel : null;
-        },
-        Math.max(300, deadline - Date.now()),
-        120
-      );
-
-      if (recovered) return true;
-
-      currentPanel = expectedName
-        ? findCommunityDetailPanel(expectedName)
-        : findLikelyOpenCommunityDetailPanel();
-
-      if (!currentPanel) {
-        return Boolean(findCommunityListPanel());
-      }
-    }
-
-    return false;
-  }
-
-  async function hardResetToCommunitiesIndex(timeoutMs = 3_200) {
-    const deadline = Date.now() + timeoutMs;
-
-    try {
-      await restoreChatsNavigation();
-    } catch (_error) {
-      // Best effort.
-    }
-
-    await sleep(180);
-
-    const communitiesNav = findPrimaryNavigationControl("communities");
-
-    if (communitiesNav) {
-      activateChatTarget(communitiesNav);
-    }
-
-    return await waitUntil(
-      () => {
-        const panel = findCommunityListPanel();
-        const detail = findLikelyOpenCommunityDetailPanel();
-
-        return panel && !detail ? panel : null;
-      },
-      Math.max(400, deadline - Date.now()),
-      130
-    );
-  }
-
-  async function ensureCommunitiesIndex(deadline, maxAttempts = 2) {
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      if (Date.now() >= deadline) return null;
-
-      const listPanel = findCommunityListPanel();
-      const detailPanel = findLikelyOpenCommunityDetailPanel();
-
-      if (listPanel && !detailPanel) {
-        return listPanel;
-      }
-
-      if (detailPanel) {
-        const detailTitle = extractCommunityPanelTitle(detailPanel);
-
-        const closed = await leaveCommunityDetailPanelVerified(
-          detailPanel,
-          detailTitle,
-          2_400
-        );
-
-        if (closed) continue;
-      }
-
-      const communitiesNav = findPrimaryNavigationControl("communities");
-
-      if (communitiesNav) {
-        activateChatTarget(communitiesNav);
-
-        const recovered = await waitUntil(
-          () => {
-            const panel = findCommunityListPanel();
-            const detail = findLikelyOpenCommunityDetailPanel();
-
-            return panel && !detail ? panel : null;
-          },
-          1_800,
-          120
-        );
-
-        if (recovered) return recovered;
-      }
-
-      const hardRecovered = await hardResetToCommunitiesIndex(
-        Math.min(3_000, Math.max(800, deadline - Date.now()))
-      );
-
-      if (hardRecovered) return hardRecovered;
-    }
-
-    return null;
-  }
   
   async function switchChatFilter(kind) {
     const control = findChatFilterControl(kind);
@@ -1938,8 +958,6 @@
     discoveredChats,
     communityGroups = 0,
     announcementsSkipped = 0,
-    inactiveCommunityGroupsSkipped = 0,
-    communitiesDiscovered = 0,
     scanStep,
     scanPass = null,
     completed = false
@@ -1950,8 +968,6 @@
         discovered_chat_count: discoveredChats,
         community_group_count: communityGroups,
         announcements_skipped: announcementsSkipped,
-        inactive_community_groups_skipped: inactiveCommunityGroupsSkipped,
-        communities_discovered: communitiesDiscovered,
         scan_step: scanStep,
         scan_pass: scanPass,
         completed
@@ -2052,26 +1068,6 @@
     }));
   }
 
-  function findLeafRowAncestor(element, boundary) {
-    let current = element;
-    const boundaryRect = boundary.getBoundingClientRect();
-    const minWidth = Math.max(115, boundaryRect.width * 0.36);
-
-    for (let depth = 0; current && current !== boundary && depth < 14; depth += 1) {
-      const rect = current.getBoundingClientRect();
-      const hasLeafGeometry =
-        rect.width >= minWidth &&
-        rect.height >= 34 &&
-        rect.height <= 125;
-
-      if (hasLeafGeometry) {
-        return current;
-      }
-      current = current.parentElement;
-    }
-    return null;
-  }
-
   function isScannerControlTitle(text) {
     const value = normalizeComparable(text || "");
     return /^(add group|tambahkan grup|view community|lihat komunitas|subgroup switcher|ic-arrow-drop-down|profile details|groups?|grups?|all|semua|back|kembali|navigation menu|menu navigasi|close|tutup|communities|komunitas|new community|komunitas baru|create community|buat komunitas)$/.test(value);
@@ -2160,21 +1156,6 @@
     return null;
   }
 
-  function findVisualRowAncestor(element, boundary) {
-    let current = element;
-
-    for (let depth = 0; current && current !== boundary && depth < 12; depth += 1) {
-      const rectangle = current.getBoundingClientRect();
-      const hasRowGeometry =
-        rectangle.width >= 180 && rectangle.height >= 38 && rectangle.height <= 155;
-
-      if (hasRowGeometry) return current;
-      current = current.parentElement;
-    }
-
-    return null;
-  }
-
   function isLikelyChatRow(row) {
     if (!(row instanceof HTMLElement) || !isVisible(row)) {
       return false;
@@ -2234,26 +1215,32 @@
       const repeatedPhysicalRows = (repeatedBaseNames.get(baseKey) || 0) >= 2;
       const hasDistinctLocalName = Boolean(localKey && localKey !== baseKey);
 
-      if (
-        baseName &&
-        hasDistinctLocalName &&
-        item.localNameStrong &&
-        (item.hasCommunityContext || repeatedPhysicalRows)
-      ) {
-        return {
-          row: item.row,
-          descriptor: buildCommunityChildDescriptor(
-            item.row,
-            item.base,
-            localName,
-            baseName
-          )
-        };
+      // FIX utama untuk kasus "semua subgroup bernama Community":
+      // Pada pass Groups, sebuah row yang punya label LOKAL (nama subgroup dari
+      // teks biasa) yang berbeda dari base name (nama Community dari span[title])
+      // adalah subgroup. Jangan lagi bergantung pada hasCommunityContextAroundRow
+      // (rapuh, bergantung pada kontrol Community di ancestor). Kunci keputusan:
+      // - jika nama terulang di banyak physical row (repeatedPhysicalRows), pasti
+      //   ini adalah Community + subgroup; pakai nama lokal.
+      // - jika ada konteks Community, juga pakai nama lokal.
+      // - jika tidak ada nama lokal yang berbeda tetapi ada konteks Community,
+      //   row ini adalah header/container Community -> dibuang.
+      if (baseName && hasDistinctLocalName && item.localNameStrong) {
+        if (item.hasCommunityContext || repeatedPhysicalRows) {
+          return {
+            row: item.row,
+            descriptor: buildCommunityChildDescriptor(
+              item.row,
+              item.base,
+              localName,
+              baseName
+            )
+          };
+        }
       }
 
-      // Header/container Community boleh muncul sebagai physical row. Jangan
-      // menawarkannya sebagai chat jika kontrol Community terdeteksi tetapi tidak
-      // ada nama child lokal yang berbeda.
+      // Header/container Community: ada kontrol Community tapi tidak ada nama
+      // child lokal yang berbeda. Buang agar tidak ditawarkan sebagai chat.
       if (item.hasCommunityContext && baseName && !hasDistinctLocalName) {
         return {
           row: item.row,
@@ -2466,6 +1453,123 @@
     return lines.at(-1)?.slice(0, 160) || "";
   }
 
+  // ---------------------------------------------------------------------------
+  // Ekstraksi nama berbasis GEOMETRI row sidebar (refactor penamaan akurat).
+  //
+  // Struktur row chat/subgroup di WhatsApp Web (lihat screenshot + outerHTML):
+  //   [NAMA COMMUNITY]  <- label kecil/abu, paling atas (hanya pada subgroup)
+  //   [NAMA GROUP/CHAT] <- label bold/berat>=500 & font>=13, tepat di bawahnya
+  //   [preview]         <- sisa baris
+  // Dengan membaca POSISI vertikal + bobot font (bukan skor ad-hoc), nama group
+  // dan community dibedakan secara deterministik -> tidak ada lagi "semua
+  // subgroup bernama sama".
+  // ---------------------------------------------------------------------------
+
+  function collectRowNameLabels(row) {
+    if (!(row instanceof HTMLElement)) return [];
+    const rowRect = row.getBoundingClientRect();
+    const seen = new Map();
+
+    for (const element of row.querySelectorAll("span, div")) {
+      if (!(element instanceof HTMLElement) || !isVisible(element)) continue;
+      const rect = element.getBoundingClientRect();
+      if (
+        rect.bottom <= rowRect.top ||
+        rect.top >= rowRect.bottom ||
+        rect.right <= rowRect.left ||
+        rect.left >= rowRect.right
+      ) {
+        continue;
+      }
+
+      const text = cleanText(directVisibleText(element) || element.getAttribute?.("title"));
+      if (!text || text.length > 120) continue;
+      if (isLikelySidebarMetadata(text) || isScannerControlTitle(text)) continue;
+      // Abaikan teks yang tampak seperti preview pesan (mis. "You: ...",
+      // "Nama: pesan", label media). Nama chat tidak mengandung pola itu.
+      if (isLikelyCommunityPreviewLine(text)) continue;
+
+      const style = getComputedStyle(element);
+      const fontSize = Number.parseFloat(style.fontSize) || 0;
+      const parsedWeight = Number.parseInt(style.fontWeight, 10);
+      const weight = Number.isFinite(parsedWeight)
+        ? parsedWeight
+        : /bold/i.test(style.fontWeight) ? 700 : 400;
+
+      const key = normalizeComparable(text);
+      const prev = seen.get(key);
+      // Dedup berdasarkan teks; simpan representasi paling "menonjol".
+      const emphasis = fontSize * 2 + weight / 50;
+      if (!prev || emphasis > prev.emphasis) {
+        seen.set(key, {
+          text,
+          top: rect.top - rowRect.top,
+          fontSize,
+          weight,
+          emphasis
+        });
+      }
+    }
+
+    return Array.from(seen.values()).sort((a, b) => a.top - b.top);
+  }
+
+  function isBoldNameLabel(label) {
+    return label.weight >= 500 || label.fontSize >= 13;
+  }
+
+  // Kembalikan { name, communityName, preview, isCommunity } berbasis geometri.
+  function extractGeometricChatNaming(row) {
+    const labels = collectRowNameLabels(row);
+    if (labels.length === 0) return null;
+
+    // Berdasarkan data diagnostik nyata ([WA-NAME-DEBUG]): SEMUA label nama pada
+    // row Community memakai font-weight 400. Bobot font TIDAK membedakan nama
+    // Community vs nama Group. Pembeda yang konsisten adalah UKURAN FONT:
+    //   "BBB World"        fs=14 (label Community, paling atas)
+    //   "BBB Kuliah only"  fs=16 (label Group, tepat di bawahnya)
+    //   preview/sender     fs=14 (di bawah)
+    // Maka: nama chat/group = label dengan FONT TERBESAR; Community = label
+    // ber-font lebih kecil yang berada TEPAT DI ATAS nama.
+    const maxFontSize = Math.max(...labels.map((label) => label.fontSize));
+    const primary = labels.find((label) => label.fontSize >= maxFontSize - 0.5);
+
+    const communityCandidate = labels
+      .filter((label) =>
+        label !== primary &&
+        label.top < primary.top - 1 &&
+        label.fontSize < primary.fontSize - 0.5
+      )
+      .sort((a, b) => b.top - a.top)[0];
+
+    const result = communityCandidate
+      ? {
+          name: primary.text,
+          communityName: communityCandidate.text,
+          isCommunity: true
+        }
+      : {
+          name: primary.text,
+          communityName: null,
+          isCommunity: false
+        };
+
+    return result;
+  }
+
+  function extractGeometricPreview(row, name, communityName) {
+    const exclude = new Set(
+      [name, communityName].map(normalizeComparable).filter(Boolean)
+    );
+    const lines = cleanText(row?.innerText || "")
+      .split("\n")
+      .map(cleanText)
+      .filter(Boolean)
+      .filter((line) => !exclude.has(normalizeComparable(line)))
+      .filter((line) => !isLikelySidebarMetadata(line));
+    return lines.at(-1)?.slice(0, 160) || "";
+  }
+
   function extractChatDescriptor(row, scanPass = "all", anchorTitle = null) {
     const titleCandidates = getChatTitleCandidates(row);
     const ariaName = extractAriaChatName(row);
@@ -2480,17 +1584,42 @@
       ].filter(Boolean))
     );
 
-    // v0.8.8: pada Groups pass, anchor child-row adalah sumber nama provisional
-    // utama. Ini mencegah wrapper Community (mis. "BBB World") menggantikan nama
-    // subgroup sebenarnya (mis. "BBB", "BBB Health share", "BBB Kuliah only").
-    const name = (scanPass === "groups" && anchorName)
-      ? anchorName
-      : (choosePrimaryChatTitle(row, titleCandidates) || ariaName);
-    const preview = name ? extractChatPreview(row, name) : "";
+    // UTAMA: penamaan berbasis geometri row. Ini menentukan nama chat/subgroup
+    // beserta community secara deterministik dari posisi + bobot font.
+    const geometric = extractGeometricChatNaming(row);
+    let name;
+    let communityName;
+    let preview;
 
-    const communityName = name && scanPass === "groups"
-      ? extractCommunityContextForAnchoredRow(row, name, titleCandidates, preview)
-      : null;
+    if (geometric && geometric.name) {
+      name = geometric.name;
+      communityName = geometric.communityName;
+      preview = extractGeometricPreview(row, name, communityName);
+    } else {
+      // Fallback bila geometri gagal (struktur tak terduga): logika lama.
+      name = choosePrimaryChatTitle(row, titleCandidates) || ariaName;
+      preview = name ? extractChatPreview(row, name) : "";
+      communityName = name && scanPass === "groups"
+        ? extractCommunityContextForAnchoredRow(row, name, titleCandidates, preview)
+        : null;
+
+      if (communityName && name) {
+        const nameKey = normalizeComparable(name);
+        const communityKey = normalizeComparable(communityName);
+        if (nameKey === communityKey) {
+          const groupCandidate = extractCommunityGroupNameCandidate(
+            row,
+            titleCandidates,
+            communityName
+          );
+          if (groupCandidate) {
+            name = groupCandidate;
+            preview = extractChatPreview(row, name);
+          }
+        }
+      }
+    }
+
     const isAnnouncement = isAnnouncementName(name) || isAnnouncementRow(row, name);
     const isCommunityContainer = isCommunityContainerHeaderRow(
       row,
@@ -2520,6 +1649,43 @@
       // clicked conversation header confirms it.
       title_aliases: titleAliases
     };
+  }
+
+  // Cari kandidat nama GROUP pada row Community ketika nama yang terpilih justru
+  // adalah nama Community (kasus "semua subgroup bernama sama"). Nama group bisa
+  // berupa span[title] maupun teks biasa. Urutan visual label nama pada row
+  // Community umumnya [Community, Group, ...preview], sehingga kandidat nama
+  // group adalah label pertama yang berbeda dari nama Community.
+  function extractCommunityGroupNameCandidate(row, titleCandidates, communityName) {
+    const communityKey = normalizeComparable(communityName || "");
+    const isEligible = (text) => {
+      const key = normalizeComparable(text || "");
+      return (
+        key &&
+        key !== communityKey &&
+        !isAnnouncementName(text) &&
+        !isScannerControlTitle(text) &&
+        !isLikelySidebarMetadata(text) &&
+        !isLikelyCommunityPreviewLine(text) &&
+        !isCommunitySectionHeading(text)
+      );
+    };
+
+    // 1) Utamakan span[title] yang berbeda dari Community (paling andal).
+    const fromTitle = (titleCandidates || [])
+      .map((candidate) => cleanText(candidate.text))
+      .find(isEligible);
+    if (fromTitle) return fromTitle;
+
+    // 2) Fallback: baris teks biasa di row (subgroup sering bukan span[title]).
+    const fromLines = extractMeaningfulRowLines(row).find(isEligible);
+    if (fromLines) return fromLines;
+
+    // 3) Fallback terakhir: kandidat teks visible dengan gaya label kuat.
+    const fromStyled = getVisibleRowTextCandidates(row)
+      .filter((candidate) => candidate.isStrongLabel && isEligible(candidate.text))
+      .sort((a, b) => b.score - a.score)[0];
+    return fromStyled?.text || null;
   }
 
   function getChatTitleCandidates(row) {
@@ -2701,7 +1867,17 @@
       !value ||
       /^\d{1,2}[:.]\d{2}$/.test(value) ||
       /^(yesterday|kemarin|today|hari ini)$/i.test(value) ||
-      /^\d+$/.test(value)
+      /^\d+$/.test(value) ||
+      // Teks badge/status unread — BUKAN nama chat. Pada row dengan pesan belum
+      // dibaca, elemen ini bisa menjadi label ber-font terbesar sehingga tanpa
+      // filter ini ia keliru terpilih sebagai nama (mis. "2 unread messages").
+      /^\d+\s+unread\s+messages?$/i.test(value) ||
+      /^unread\s+messages?$/i.test(value) ||
+      /\bunread\s+messages?\b/i.test(value) ||
+      /^\d+\s+(pesan\s+)?belum\s+dibaca$/i.test(value) ||
+      /\bbelum\s+dibaca\b/i.test(value) ||
+      // Teks tanggal seperti "4/6/2026" atau "06/09/2026".
+      /^\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}$/.test(value)
     );
   }
 
@@ -2781,68 +1957,6 @@
     )).sort().join("~");
   }
 
-  function reconcileAuthoritativeCommunityEntries(entries, state) {
-    const communityNames = state?.authoritativeCommunityNames instanceof Set
-      ? state.authoritativeCommunityNames
-      : new Set();
-    if (communityNames.size === 0) return { entries, removedCount: 0 };
-
-    const authoritative = entries.filter((entry) => entry.discovered_via_community_panel);
-    const childNameCounts = new Map();
-    const authoritativeByName = new Map();
-    for (const entry of authoritative) {
-      const nameKey = normalizeComparable(entry.name || "");
-      if (!nameKey) continue;
-      childNameCounts.set(nameKey, (childNameCounts.get(nameKey) || 0) + 1);
-      if (!authoritativeByName.has(nameKey)) authoritativeByName.set(nameKey, []);
-      authoritativeByName.get(nameKey).push(entry);
-    }
-
-    let removedCount = 0;
-    const filtered = entries.filter((entry) => {
-      if (entry.discovered_via_community_panel) return true;
-      const nameKey = normalizeComparable(entry.name || "");
-      const communityKey = normalizeComparable(entry.community_name || "");
-      const previewKey = normalizeComparable(entry.preview || "");
-
-      // Community header/wrapper captured by All/Groups.
-      if (communityNames.has(nameKey)) {
-        removedCount += 1;
-        return false;
-      }
-
-      // Any flat Community-labelled row from a Community that we successfully
-      // scanned is lower-authority than the hierarchy result and is discarded.
-      if (entry.source_kind === "community_group" && communityNames.has(communityKey)) {
-        removedCount += 1;
-        return false;
-      }
-
-      // De-duplicate a subgroup that also appears as a normal chat in All/Groups.
-      const matches = authoritativeByName.get(nameKey) || [];
-      if (matches.length === 1) {
-        const candidatePreview = normalizeComparable(matches[0].preview || "");
-        const exactPreview = Boolean(previewKey && candidatePreview && previewKey === candidatePreview);
-        if (entry.discovered_via_groups_filter || exactPreview) {
-          removedCount += 1;
-          return false;
-        }
-      }
-      if (matches.length > 1 && previewKey) {
-        const exactPreview = matches.some((candidate) =>
-          normalizeComparable(candidate.preview || "") === previewKey
-        );
-        if (exactPreview) {
-          removedCount += 1;
-          return false;
-        }
-      }
-
-      return true;
-    });
-
-    return { entries: filtered, removedCount };
-  }
 
   function removeCommunityContainerEntries(entries) {
     const communityNames = new Set(
@@ -3270,11 +2384,17 @@
       url: zipUrl,
       saveAs: false
     });
-    URL.revokeObjectURL(zipUrl);
 
     if (!downloadResponse?.ok) {
+      URL.revokeObjectURL(zipUrl);
       throw new Error(downloadResponse?.error || "File ZIP gagal diunduh.");
     }
+
+    // JANGAN revoke segera setelah request. chrome.downloads.download() resolve
+    // saat unduhan dimulai, tetapi service worker mungkin masih membaca object
+    // URL ini. Revoke terlalu dini membuat ZIP gagal terunduh dan hasil ekspor
+    // seolah-olah hanya berupa file terpisah. Tunda pembersihan.
+    setTimeout(() => URL.revokeObjectURL(zipUrl), 60_000);
 
     return {
       ok: true,
@@ -4096,32 +3216,6 @@
     );
   }
 
-  async function waitForConversation(expectedName, timeoutMs = 12_000) {
-    const deadline = Date.now() + timeoutMs;
-    let stableMatches = 0;
-
-    while (Date.now() < deadline) {
-      const main = document.querySelector("#main");
-
-      if (main && headerContainsExpectedName(main, expectedName)) {
-        stableMatches += 1;
-
-        // Dua pembacaan berturut-turut menghindari kondisi header lama yang
-        // masih tersisa sesaat saat berpindah chat.
-        if (stableMatches >= 2) {
-          await waitForConversationBody(main, 3_500);
-          return;
-        }
-      } else {
-        stableMatches = 0;
-      }
-
-      await sleep(180);
-    }
-
-    throw new Error(`Chat “${expectedName}” tidak berhasil dikonfirmasi pada header.`);
-  }
-
   async function waitForConversationBody(main, timeoutMs = 6_000) {
     const deadline = Date.now() + timeoutMs;
 
@@ -4148,17 +3242,6 @@
     // Jangan gagalkan openChat. scrapeConversation memiliki resolver yang
     // menunggu ulang dan lebih agresif.
     await sleep(300);
-  }
-
-  function headerContainsExpectedName(main, expectedName) {
-    const expected = normalizeComparable(expectedName);
-    if (!main || !expected) {
-      return false;
-    }
-
-    return getHeaderNameCandidates(main).some(
-      (candidate) => normalizeComparable(candidate) === expected
-    );
   }
 
   function getHeaderNameCandidates(main) {
@@ -4227,10 +3310,6 @@
       .find(Boolean);
 
     return firstLine || candidates[0] || null;
-  }
-
-  function namesProbablyMatch(actual, expected) {
-    return normalizeComparable(actual) === normalizeComparable(expected);
   }
 
   async function scrapeConversation(entry, options, onProgress = () => {}) {
@@ -4885,8 +3964,11 @@
       media: buildInitialMediaMetadata(media),
       reply_to: extractReplyPreview(bubble, text, nativeId),
       _capture_order: captureOrder,
-      _image_candidates: media?.detectedAs === "image"
-        ? media.imageElements.map(buildImageCandidate).filter(Boolean)
+      // Satu kandidat terbaik saja per pesan (anti-double). Sebelumnya SEMUA
+      // kandidat (img + background fallback) ikut diekspor sehingga satu gambar
+      // fisik bisa tersimpan lebih dari sekali.
+      _image_candidates: media?.detectedAs === "image" && media.imageElement
+        ? [buildImageCandidate(media.imageElement)].filter(Boolean)
         : []
     };
   }
@@ -5164,13 +4246,11 @@
       previewError = error;
     }
 
-    const previewQuality = previewResult
-      ? classifyImageQuality(previewResult.width, previewResult.height, previewResult.blob.size)
-      : "low";
-
-    const shouldTryViewer =
-      options.imageExportMode === "readable" &&
-      candidate?.element?.isConnected;
+    // SEDERHANA: saat export gambar aktif, SELALU coba buka media viewer terlebih
+    // dahulu (buka->simpan) untuk mendapat file kualitas terbaik, lalu fallback ke
+    // resource DOM bila viewer gagal. Mode preview/readable tidak lagi mengontrol
+    // perilaku — keduanya menambah kompleksitas tanpa manfaat nyata.
+    const shouldTryViewer = candidate?.element?.isConnected;
 
     if (shouldTryViewer) {
       viewerAttempted = true;
@@ -5423,14 +4503,22 @@
     return output;
   }
 
+  const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+      let c = n;
+      for (let k = 0; k < 8; k += 1) {
+        c = (c & 1) === 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      }
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
   function crc32Bytes(bytes) {
     let crc = 0xffffffff;
     for (let i = 0; i < bytes.length; i += 1) {
-      crc ^= bytes[i];
-      for (let bit = 0; bit < 8; bit += 1) {
-        const isSet = (crc & 1) === 1;
-        crc = (crc >>> 1) ^ (isSet ? 0xedb88320 : 0);
-      }
+      crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
     }
     return (crc ^ 0xffffffff) >>> 0;
   }
@@ -5871,15 +4959,6 @@
     });
   }
 
-  function blobToDataUrl(blob) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result || ""));
-      reader.onerror = () => reject(reader.error || new Error("Gagal mengubah gambar menjadi data URL."));
-      reader.readAsDataURL(blob);
-    });
-  }
-
   function normalizeImageMime(mimeType, source) {
     const normalized = cleanText(mimeType).toLowerCase();
     if (normalized.startsWith("image/")) {
@@ -6220,6 +5299,16 @@
 
     const documentSemantic = /document|dokumen|attachment|lampiran/.test(labels);
 
+    // PENTING: deteksi video/GIF HARUS mendahului deteksi gambar. Bubble video
+    // dan GIF juga memiliki elemen <img> (thumbnail/poster) sehingga tanpa
+    // guard ini thumbnail-nya keliru dianggap gambar dan ikut diekspor.
+    const hasVideoElement = Boolean(bubble.querySelector("video"));
+    const hasPlayIndicator = Boolean(
+      bubble.querySelector(
+        '[data-icon*="play"], [data-icon*="video"], [aria-label*="Play" i], [aria-label*="Putar" i], [aria-label*="video" i]'
+      )
+    );
+
     if (/sticker|stiker/.test(labels)) {
       detectedAs = "sticker";
     } else if (/voice message|voice note|pesan suara/.test(labels)) {
@@ -6228,7 +5317,7 @@
       detectedAs = "audio";
     } else if (/\bgif\b/.test(labels)) {
       detectedAs = "gif";
-    } else if (bubble.querySelector("video")) {
+    } else if (hasVideoElement || hasPlayIndicator) {
       detectedAs = "video";
     } else if (/location|lokasi|map|peta/.test(labels)) {
       detectedAs = "location";
@@ -6276,15 +5365,16 @@
       candidates.push(element);
     }
 
-    // Beberapa build WhatsApp merender preview sebagai CSS background. Batasi
-    // fallback ini pada elemen berukuran media agar tidak menangkap dekorasi.
-    if (candidates.length === 0) {
-      for (const element of bubble.querySelectorAll("div, span")) {
-        const rectangle = element.getBoundingClientRect();
-        if (rectangle.width < 96 || rectangle.height < 96) continue;
-        if (!extractBackgroundImageUrl(element)) continue;
-        candidates.push(element);
-      }
+    // Beberapa build WhatsApp merender gambar sebagai CSS background, bukan
+    // <img>. Sebelumnya fallback ini hanya berjalan bila TIDAK ada <img>, sehingga
+    // bubble yang memiliki <img> kecil (mis. ikon/emotikon) membuat gambar
+    // background-asli tidak pernah terdeteksi -> gambar ter-skip. Sekarang
+    // background-image SELALU ikut dikumpulkan sebagai kandidat tambahan.
+    for (const element of bubble.querySelectorAll("div, span")) {
+      const rectangle = element.getBoundingClientRect();
+      if (rectangle.width < 96 || rectangle.height < 96) continue;
+      if (!extractBackgroundImageUrl(element)) continue;
+      candidates.push(element);
     }
 
     return candidates.sort((a, b) => imageArea(b) - imageArea(a));
@@ -6601,18 +5691,6 @@
     }
 
     return cleanText(id) || null;
-  }
-
-  function extractElementSignature(element) {
-    if (!element) {
-      return "";
-    }
-
-    return [
-      String(element.className || ""),
-      cleanText(element.getAttribute?.("aria-label")),
-      cleanText(element.innerText).slice(0, 150)
-    ].join("|");
   }
 
   function inferChatType(main) {

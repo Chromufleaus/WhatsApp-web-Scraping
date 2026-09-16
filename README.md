@@ -1,4 +1,4 @@
-# WhatsApp JSON + Image Exporter v1.0
+# WhatsApp JSON + Image Exporter v0.2.0
 
 v0.9.2 memfokuskan perbaikan pada alur Community dan keamanan queue ekspor. Scanner selalu memulai dari Chats, memindai All + Groups, lalu berpindah ke Communities. Daftar nama Community dikumpulkan terlebih dahulu sebagai snapshot; setelah itu Community dibuka satu per satu berdasarkan snapshot tersebut. Cara ini menghindari row virtual yang berubah saat panel detail dibuka/ditutup.
 

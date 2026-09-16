@@ -7,7 +7,6 @@ const maxMessagesInput = document.getElementById("maxMessages");
 const loadWaitSecondsInput = document.getElementById("loadWaitSeconds");
 const exportImagesInput = document.getElementById("exportImages");
 const imageWaitSecondsInput = document.getElementById("imageWaitSeconds");
-const imageExportModeInput = document.getElementById("imageExportMode");
 const chatSearchInput = document.getElementById("chatSearch");
 const clearSearchButton = document.getElementById("clearSearch");
 const selectionMeta = document.getElementById("selectionMeta");
@@ -80,7 +79,6 @@ function setBusy(isBusy) {
   loadWaitSecondsInput.disabled = isBusy;
   exportImagesInput.disabled = isBusy;
   imageWaitSecondsInput.disabled = isBusy || !exportImagesInput.checked;
-  imageExportModeInput.disabled = isBusy || !exportImagesInput.checked;
   updateSelectionUi();
 }
 
@@ -150,7 +148,11 @@ function renderChats() {
 
     const name = document.createElement("span");
     name.className = "chat-name";
-    name.textContent = chat.name;
+    // Tampilkan group Community sebagai "NAMA GROUP (NAMA KOMUNITAS)" agar tidak
+    // ambigu bila ada beberapa group dalam satu Community.
+    name.textContent = chat.community_name && chat.source_kind === "community_group"
+      ? `${chat.name} (${chat.community_name})`
+      : chat.name;
     titleRow.appendChild(name);
 
     if (chat.community_name) {
@@ -306,8 +308,6 @@ chrome.runtime.onMessage.addListener((message) => {
     const count = Number(message.discovered_chat_count || 0);
     const communityCount = Number(message.community_group_count || 0);
     const skipped = Number(message.announcements_skipped || 0);
-    const inactiveSkipped = Number(message.inactive_community_groups_skipped || 0);
-    const communitiesFound = Number(message.communities_discovered || 0);
     const passLabel = message.scan_pass === "community_detail"
       ? "detail Community"
       : message.scan_pass === "communities"
@@ -321,9 +321,7 @@ chrome.runtime.onMessage.addListener((message) => {
               : "sidebar";
     const detail = [
       communityCount > 0 ? `${communityCount} subgroup Community aktif` : null,
-      communitiesFound > 0 ? `${communitiesFound} Community ditemukan` : null,
-      skipped > 0 ? `${skipped} announcements dilewati` : null,
-      inactiveSkipped > 0 ? `${inactiveSkipped} subgroup yang belum diikuti dilewati` : null
+      skipped > 0 ? `${skipped} announcements dilewati` : null
     ].filter(Boolean).join(" · ");
     const suffix = detail ? ` (${detail})` : "";
 
@@ -356,7 +354,6 @@ chrome.runtime.onMessage.addListener((message) => {
 
 exportImagesInput.addEventListener("change", () => {
   imageWaitSecondsInput.disabled = busy || !exportImagesInput.checked;
-  imageExportModeInput.disabled = busy || !exportImagesInput.checked;
 });
 
 chatSearchInput.addEventListener("input", () => {
@@ -376,10 +373,15 @@ scanButton.addEventListener("click", async () => {
   chats = [];
   chatSearchInput.value = "";
   renderChats();
-  setStatus("Memindai Chats terlebih dahulu, lalu mengambil snapshot daftar Communities dan memeriksa setiap Community satu per satu. Hanya subgroup yang Anda ikuti yang akan ditawarkan…");
+  setStatus(
+    "Memindai daftar Chats (All & Groups). Cepat — tanpa membuka panel Communities…"
+  );
 
   try {
-    const response = await sendToContent({ type: "SCAN_ALL_CHATS" });
+    const response = await sendToContent({
+      type: "SCAN_ALL_CHATS",
+      options: {}
+    });
 
     if (!response?.ok) {
       throw new Error(response?.error || "Pemindaian gagal.");
@@ -392,36 +394,17 @@ scanButton.addEventListener("click", async () => {
     const extras = [
       scanStats.groups_filter_scanned ? "Groups dipindai" : null,
       scanStats.groups_verification_pass ? "verification pass selesai" : null,
-      scanStats.community_navigation_attempted ? "Communities ditelusuri" : null,
-      Number(scanStats.communities_discovered || 0) > 0
-        ? `${scanStats.communities_discovered} Community ditemukan`
-        : null,
-      Number(scanStats.communities_opened || 0) > 0
-        ? `${scanStats.communities_opened} Community diperiksa`
-        : null,
-      Number(scanStats.community_detail_groups_found || 0) > 0
-        ? `${scanStats.community_detail_groups_found} subgroup ditemukan dari panel Community`
-        : null,
       Number(scanStats.community_group_count || 0) > 0
         ? `${scanStats.community_group_count} subgroup Community total`
         : null,
-      Number(scanStats.community_orientation_repairs || 0) > 0
-        ? `${scanStats.community_orientation_repairs} identitas Community dinormalisasi`
-        : null,
-      Number(scanStats.stale_flat_community_entries_removed || 0) > 0
-        ? `${scanStats.stale_flat_community_entries_removed} kandidat Community flat dibuang`
+      Number(scanStats.community_containers_removed || 0) > 0
+        ? `${scanStats.community_containers_removed} container Community dibuang`
         : null,
       Number(scanStats.post_repair_merged_entries || 0) > 0
         ? `${scanStats.post_repair_merged_entries} duplikat pass digabung`
         : null,
       Number(scanStats.announcements_skipped || 0) > 0
         ? `${scanStats.announcements_skipped} announcements dilewati`
-        : null,
-      Number(scanStats.inactive_community_groups_skipped || 0) > 0
-        ? `${scanStats.inactive_community_groups_skipped} subgroup yang belum diikuti dilewati`
-        : null,
-      Number(scanStats.community_open_failures || 0) > 0
-        ? `${scanStats.community_open_failures} Community gagal dibuka saat verifikasi`
         : null
     ].filter(Boolean).join(" · ");
 
@@ -491,7 +474,6 @@ exportButton.addEventListener("click", async () => {
         maxMessages,
         maxLoadWaitMs: loadWaitSeconds * 1000,
         exportImages: exportImagesInput.checked,
-        imageExportMode: imageExportModeInput.value,
         imageLoadWaitMs: imageWaitSeconds * 1000
       }
     });
