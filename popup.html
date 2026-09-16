@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WhatsApp JSON + Image Exporter</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="app">
+    <header class="hero">
+      <div class="hero-topline">
+        <span class="version-badge">v0.9.2</span>
+        <span class="local-badge">Pemrosesan lokal</span>
+      </div>
+      <h1>WhatsApp JSON + Image Exporter</h1>
+      <p>Scan chat, subgroup Community, teks, reply sequence, dan gambar. Announcements otomatis dilewati.</p>
+    </header>
+
+    <section class="panel settings" aria-labelledby="settingsTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="settingsTitle">Pengaturan ekspor</h2>
+          <p>Pesan lama dimuat otomatis sampai target tercapai atau tidak ada progres lagi.</p>
+        </div>
+      </div>
+
+      <div class="settings-grid">
+        <label class="field">
+          <span>Maksimum pesan / chat</span>
+          <input id="maxMessages" type="number" min="1" max="5000" value="200">
+        </label>
+
+        <label class="field">
+          <span>Tunggu muat pesan</span>
+          <div class="input-suffix">
+            <input id="loadWaitSeconds" type="number" min="1" max="30" value="8">
+            <span>detik</span>
+          </div>
+        </label>
+      </div>
+
+      <div class="media-settings">
+        <label class="toggle-row">
+          <span>
+            <strong>Ekspor gambar</strong>
+            <small>Simpan gambar yang berhasil diambil ke folder media.</small>
+          </span>
+          <input id="exportImages" type="checkbox" checked>
+        </label>
+
+        <div class="settings-grid image-controls">
+          <label class="field">
+            <span>Mode gambar</span>
+            <select id="imageExportMode">
+              <option value="readable" selected>Readable / kualitas lebih baik</option>
+              <option value="preview">Preview cepat</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Tunggu gambar / viewer</span>
+            <div class="input-suffix">
+              <input id="imageWaitSeconds" type="number" min="1" max="30" value="8">
+              <span>detik</span>
+            </div>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel scanner" aria-labelledby="scannerTitle">
+      <div class="section-heading scanner-heading">
+        <div>
+          <h2 id="scannerTitle">Pilih chat</h2>
+          <p>Scanner selalu mulai dari Chats, lalu mengambil snapshot Communities dan memeriksa tiap Community satu per satu. Hanya subgroup yang Anda ikuti yang ditawarkan.</p>
+        </div>
+        <button id="scanButton" type="button" class="primary compact">Pindai</button>
+      </div>
+
+      <p id="status" class="status" role="status">Buka WhatsApp Web, lalu klik Pindai.</p>
+
+      <div class="search-row">
+        <div class="search-box">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="chatSearch" type="search" autocomplete="off" placeholder="Cari chat, grup, atau komunitas…" disabled>
+          <button id="clearSearch" type="button" class="icon-button" aria-label="Hapus pencarian" title="Hapus pencarian" hidden>×</button>
+        </div>
+        <button id="selectAllButton" type="button" class="secondary compact" disabled>Pilih semua</button>
+      </div>
+
+      <div class="selection-bar">
+        <span id="selectionMeta">0 dipilih · 0 chat</span>
+      </div>
+
+      <div id="chatList" class="chat-list" aria-label="Daftar chat">
+        <div class="empty-state">Belum ada daftar chat.</div>
+      </div>
+    </section>
+
+    <section id="resultsSection" class="panel results" aria-label="Hasil ekspor" hidden>
+      <div class="section-heading">
+        <div>
+          <h2>Hasil ekspor</h2>
+          <p>Status setiap chat yang dicoba.</p>
+        </div>
+      </div>
+      <div id="resultSummary" class="result-summary"></div>
+    </section>
+
+    <div class="bottom-action">
+      <button id="exportButton" type="button" class="primary export" disabled>
+        Ekspor chat terpilih
+      </button>
+      <p>Jangan berinteraksi dengan WhatsApp Web selama scan atau ekspor berlangsung.</p>
+    </div>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
